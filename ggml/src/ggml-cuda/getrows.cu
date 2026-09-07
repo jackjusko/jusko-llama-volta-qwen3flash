@@ -2,6 +2,62 @@
 #include "dequantize.cuh"
 #include "convert.cuh"
 
+// Exact raw q8_0 row gather. Used by Qwen4exp sparse QSA so native q8 FlashAttention
+// can consume selected cache rows without first materializing F32/F16 K/V tensors.
+// q8_0 rows are copied byte-for-byte; no requantization or floating-point work occurs.
+static __global__ void k_get_rows_q8_0_raw(
+        const char * __restrict__ src0, const int32_t * __restrict__ src1, char * __restrict__ dst,
+        const int64_t row_vecs, const int64_t ne11, const uint3 ne12_fdv,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12,
+        const size_t nb1, const size_t nb2, const size_t nb3) {
+    ggml_cuda_pdl_sync();
+    for (int64_t z = blockIdx.z; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.z) {
+        const int i10 = blockIdx.x;
+        const uint2 dm = fast_div_modulo((uint32_t) z, ne12_fdv);
+        const int i11 = dm.x;
+        const int i12 = dm.y;
+        const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+
+        const int4 * src_row = reinterpret_cast<const int4 *>(src0 + i01*nb01 + i11*nb02 + i12*nb03);
+        int4 * dst_row = reinterpret_cast<int4 *>(dst + i10*nb1 + i11*nb2 + i12*nb3);
+
+        for (int64_t iv = blockIdx.y*blockDim.x + threadIdx.x; iv < row_vecs; iv += gridDim.y*blockDim.x) {
+            dst_row[iv] = src_row[iv];
+        }
+    }
+}
+
+static void get_rows_cuda_q8_0_raw(
+        const void * src0_d, const int32_t * src1_d, void * dst_d,
+        const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12,
+        const size_t nb10, const size_t nb11, const size_t nb12,
+        const size_t nb1, const size_t nb2, const size_t nb3,
+        cudaStream_t stream) {
+    const size_t row_bytes = ggml_row_size(GGML_TYPE_Q8_0, ne00);
+    GGML_ASSERT(row_bytes % sizeof(int4) == 0);
+    GGML_ASSERT(((uintptr_t) src0_d % alignof(int4)) == 0 && ((uintptr_t) dst_d % alignof(int4)) == 0);
+    GGML_ASSERT(nb01 % sizeof(int4) == 0 && nb02 % sizeof(int4) == 0 && nb03 % sizeof(int4) == 0);
+    GGML_ASSERT(nb1  % sizeof(int4) == 0 && nb2  % sizeof(int4) == 0 && nb3  % sizeof(int4) == 0);
+
+    const int64_t row_vecs = row_bytes / sizeof(int4);
+    const dim3 block_dims(CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
+    const int block_num_y = (row_vecs + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
+    const dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
+    GGML_ASSERT(ne12 > 0);
+    GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
+    const uint3 ne12_fdv = init_fastdiv_values(ne12);
+
+    const size_t s10 = nb10 / sizeof(int32_t);
+    const size_t s11 = nb11 / sizeof(int32_t);
+    const size_t s12 = nb12 / sizeof(int32_t);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
+    ggml_cuda_kernel_launch(k_get_rows_q8_0_raw, launch_params,
+        (const char *) src0_d, src1_d, (char *) dst_d, row_vecs, ne11, ne12_fdv,
+        nb01, nb02, nb03, s10, s11, s12, nb1, nb2, nb3);
+}
+
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
@@ -36,6 +92,77 @@ static __global__ void k_get_rows(
 
             dst_row[iybs + iqs + 0]        = ggml_cuda_cast<dst_t>(v.x);
             dst_row[iybs + iqs + y_offset] = ggml_cuda_cast<dst_t>(v.y);
+        }
+    }
+}
+
+// Qwen4Exp QSA PP block selection: map selected logical block ids to the r physical
+// cache-cell ids stored in blk_cells. The map is shared by all queries in one stream.
+static __global__ void k_qsa_selected_blocks_to_cells(
+        const int32_t * blk_cells, const int32_t * top_blocks, int32_t * dst,
+        int64_t r, int64_t n_blocks, int64_t block_budget, int64_t n_tps, int64_t n_stream,
+        size_t top_s0, size_t top_s1, size_t top_s2) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t n = r * block_budget * n_tps * n_stream;
+    if (i >= n) {
+        return;
+    }
+    const int64_t g = i % r;
+    int64_t t = i / r;
+    const int64_t ib = t % block_budget;
+    t /= block_budget;
+    const int64_t iq = t % n_tps;
+    const int64_t is = t / n_tps;
+
+    const int32_t block = top_blocks[ib*top_s0 + iq*top_s1 + is*top_s2];
+    if (block < 0 || block >= n_blocks) {
+        dst[i] = -1;
+        return;
+    }
+    dst[i] = blk_cells[is*(r*n_blocks) + (int64_t) block*r + g];
+}
+
+// Qwen4exp QSA block pooling: four physical q8_0 rows form one compressed key.
+// The source row ids still come from the ordinary blk_cells tensor, so this does not
+// assume an identity/contiguous KV layout. Addition order matches the graph fallback.
+static __global__ void k_get_rows_q8_0_mean4(
+        const void * __restrict__ src0, const int32_t * __restrict__ src1, float * __restrict__ dst,
+        const int64_t ne00, const int64_t ne11, const uint3 ne12_fdv,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+
+    ggml_cuda_pdl_sync();
+    for (int64_t z = blockIdx.z; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.z) {
+        for (int64_t i00 = 2*(blockIdx.y*blockDim.x + threadIdx.x); i00 < ne00; i00 += gridDim.y*blockDim.x) {
+            const int i10 = blockIdx.x;
+            const uint2 dm = fast_div_modulo((uint32_t) z, ne12_fdv);
+            const int i11 = dm.x;
+            const int i12 = dm.y;
+
+            const int ib   =  i00/QK8_0;
+            const int iqs  = (i00%QK8_0)/QR8_0;
+            const int iybs = i00 - i00%QK8_0;
+            const int y_offset = QR8_0 == 1 ? 1 : QK8_0/2;
+
+            const int i01_0 = src1[(4*i10 + 0)*s10 + i11*s11 + i12*s12];
+            const void * src0_row_0 = (const char *) src0 + i01_0*nb01 + i11*nb02 + i12*nb03;
+            float2 sum;
+            dequantize_q8_0(src0_row_0, ib, iqs, sum);
+#pragma unroll
+            for (int g = 1; g < 4; ++g) {
+                const int i01 = src1[(4*i10 + g)*s10 + i11*s11 + i12*s12];
+                const void * src0_row = (const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03;
+                float2 v;
+                dequantize_q8_0(src0_row, ib, iqs, v);
+                // Preserve the fallback's sequential F32 accumulation order.
+                sum.x += v.x;
+                sum.y += v.y;
+            }
+
+            float * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
+            dst_row[iybs + iqs + 0]        = sum.x * 0.25f;
+            dst_row[iybs + iqs + y_offset] = sum.y * 0.25f;
         }
     }
 }
@@ -433,6 +560,11 @@ void get_rows_cuda(
             ggml_cuda_get_rows_switch_src0_type(src0_d, src0_type, src1_d, (nv_bfloat16 *) dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
+        case GGML_TYPE_Q8_0:
+            GGML_ASSERT(src0_type == GGML_TYPE_Q8_0);
+            get_rows_cuda_q8_0_raw(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
         default:
             GGML_ABORT("%s: unsupported dst type: %s\n", __func__, ggml_type_name(dst_type));
             break;
@@ -453,6 +585,51 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src0->nb[0] == ggml_type_size(src0->type));
     GGML_ASSERT(src1->nb[0] == ggml_type_size(src1->type));
     GGML_ASSERT(dst->nb[0]  == ggml_type_size(dst->type));
+
+    // Private Qwen4Exp block-id expansion. Unmarked GET_ROWS nodes retain the ordinary path.
+    if (ggml_get_op_params_i32(dst, 0) == 0x51534243) {
+        const int64_t r = ggml_get_op_params_i32(dst, 1);
+        GGML_ASSERT(r > 0 && src0->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32);
+        GGML_ASSERT(src0->ne[0] % r == 0);
+        const int64_t n_blocks = src0->ne[0]/r;
+        const int64_t block_budget = src1->ne[0];
+        const int64_t n_tps = src1->ne[1];
+        const int64_t n_stream = src1->ne[2];
+        GGML_ASSERT(dst->ne[0] == r && dst->ne[1] == block_budget &&
+                    dst->ne[2] == n_tps && dst->ne[3] == n_stream);
+        constexpr int threads = 256;
+        const int64_t n = r*block_budget*n_tps*n_stream;
+        const dim3 blocks((unsigned int) ((n + threads - 1)/threads));
+        k_qsa_selected_blocks_to_cells<<<blocks, threads, 0, stream>>>(
+                (const int32_t *) src0->data, (const int32_t *) src1->data, (int32_t *) dst->data,
+                r, n_blocks, block_budget, n_tps, n_stream,
+                src1->nb[0]/sizeof(int32_t), src1->nb[1]/sizeof(int32_t), src1->nb[2]/sizeof(int32_t));
+        return;
+    }
+
+    // Private Qwen4exp marker. Unmarked GET_ROWS nodes retain the ordinary backend path
+    // regardless of any unrelated op_params contents.
+    const bool qsa_mean4 = ggml_get_op_params_i32(dst, 0) == 0x51534104 &&
+                           ggml_get_op_params_i32(dst, 1) == 4;
+    if (qsa_mean4) {
+        GGML_ASSERT(src0->type == GGML_TYPE_Q8_0 && dst->type == GGML_TYPE_F32);
+        GGML_ASSERT(ne10 == 4*ne1 && ne2 == ne11 && ne3 == ne12);
+        GGML_ASSERT(ne00 % 2 == 0);
+        GGML_ASSERT(ne12 > 0 && ne11 <= std::numeric_limits<uint32_t>::max()/ne12);
+
+        const dim3 block_dims(CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
+        const int block_num_y = (ne00 + 2*CUDA_GET_ROWS_BLOCK_SIZE - 1)/(2*CUDA_GET_ROWS_BLOCK_SIZE);
+        const dim3 block_nums(ne1, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, (int64_t) UINT16_MAX));
+        const uint3 ne12_fdv = init_fastdiv_values(ne12);
+
+        k_get_rows_q8_0_mean4<<<block_nums, block_dims, 0, stream>>>(
+            src0->data, (const int32_t *) src1->data, (float *) dst->data,
+            ne00, ne11, ne12_fdv,
+            nb1/sizeof(float), nb2/sizeof(float), nb3/sizeof(float),
+            nb01, nb02, nb03,
+            nb10/sizeof(int32_t), nb11/sizeof(int32_t), nb12/sizeof(int32_t));
+        return;
+    }
 
     get_rows_cuda(src0->data, src0->type, (const int32_t *) src1->data, dst->data, dst->type,
         ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);

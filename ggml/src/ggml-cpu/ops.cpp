@@ -4991,6 +4991,47 @@ static void ggml_compute_forward_get_rows_q(
     const ggml_type type = src0->type;
     ggml_to_float_t const dequantize_row_q = ggml_get_type_traits(type)->to_float;
 
+    // Private Qwen4exp marker. Unmarked GET_ROWS nodes keep the ordinary CPU path.
+    const bool qsa_mean4 = ggml_get_op_params_i32(dst, 0) == 0x51534104 &&
+                           ggml_get_op_params_i32(dst, 1) == 4;
+    if (qsa_mean4) {
+        constexpr int32_t reduce_group = 4;
+        GGML_ASSERT(type == GGML_TYPE_Q8_0);
+        GGML_ASSERT(ne0 == nc && nc <= 256);
+        GGML_ASSERT(ne10 == reduce_group*ne1 && ne2 == ne11 && ne3 == ne12);
+        GGML_ASSERT(nb00 == ggml_type_size(type));
+
+        const int ith = params->ith;
+        const int nth = params->nth;
+        const int64_t nr_out = ggml_nrows(dst);
+        const int64_t dr = (nr_out + nth - 1)/nth;
+        const int64_t ir0 = dr*ith;
+        const int64_t ir1 = MIN(ir0 + dr, nr_out);
+        float tmp[256];
+
+        for (int64_t i = ir0; i < ir1; ++i) {
+            const int64_t i3 = i/(ne2*ne1);
+            const int64_t rem = i - i3*ne2*ne1;
+            const int64_t i2 = rem/ne1;
+            const int64_t i1 = rem - i2*ne1;
+            float * d = (float *) ((char *) dst->data + i1*nb1 + i2*nb2 + i3*nb3);
+
+            for (int32_t g = 0; g < reduce_group; ++g) {
+                const int64_t i01 = *(int32_t *) ((char *) src1->data + (reduce_group*i1 + g)*nb10 + i2*nb11 + i3*nb12);
+                GGML_ASSERT(i01 >= 0 && i01 < ne01);
+                float * out = g == 0 ? d : tmp;
+                dequantize_row_q((const void *) ((char *) src0->data + i01*nb01 + i2*nb02 + i3*nb03), out, nc);
+                if (g != 0) {
+                    for (int64_t j = 0; j < nc; ++j) {
+                        d[j] = d[j] + tmp[j];
+                    }
+                }
+            }
+            ggml_vec_scale_f32(nc, d, 0.25f);
+        }
+        return;
+    }
+
     assert(ne0  == nc);
     assert(ne02 == ne11);
     assert(nb00 == ggml_type_size(type));
@@ -5148,6 +5189,32 @@ void ggml_compute_forward_get_rows(
         ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    if (ggml_get_op_params_i32(dst, 0) == 0x51534243) {
+        const int64_t r = ggml_get_op_params_i32(dst, 1);
+        GGML_ASSERT(r > 0 && src0->type == GGML_TYPE_I32 && src1->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32);
+        const int64_t n_blocks = src0->ne[0]/r;
+        const int64_t block_budget = src1->ne[0];
+        const int64_t n_tps = src1->ne[1];
+        const int64_t n_stream = src1->ne[2];
+        const int64_t n = r*block_budget*n_tps*n_stream;
+        const int ith = params->ith;
+        const int nth = params->nth;
+        for (int64_t i = ith; i < n; i += nth) {
+            const int64_t g = i % r;
+            int64_t t = i/r;
+            const int64_t ib = t % block_budget;
+            t /= block_budget;
+            const int64_t iq = t % n_tps;
+            const int64_t is = t / n_tps;
+            const int32_t block = *(const int32_t *) ((const char *) src1->data +
+                    ib*src1->nb[0] + iq*src1->nb[1] + is*src1->nb[2]);
+            ((int32_t *) dst->data)[i] = block < 0 || block >= n_blocks ? -1 :
+                    ((const int32_t *) src0->data)[is*(r*n_blocks) + (int64_t) block*r + g];
+        }
+        return;
+    }
 
     switch (src0->type) {
         case GGML_TYPE_Q1_0:
@@ -5260,6 +5327,9 @@ static void ggml_compute_forward_set_rows_impl(
 
                 const int64_t i1 = *(idx_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
+                if (dst->op_params[0] == 0x51535042 && i1 < 0) {
+                    continue;
+                }
                 GGML_ASSERT(i1 >= 0 && i1 < ne1);
 
                 if constexpr (std::is_same_v<src_t, float>) {
