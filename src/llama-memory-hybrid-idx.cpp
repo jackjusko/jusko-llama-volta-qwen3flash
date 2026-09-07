@@ -681,12 +681,11 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * direct_mask) const {
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
-    GGML_ASSERT(cell_blk && blk_cells && blk_pos && bias);
+    GGML_ASSERT(blk_pos && bias);
 
-<<<<<<< HEAD
     // Slim decode does not reference cell_blk. Pooled-K decode does not reference blk_cells.
-    const bool have_cell_blk  = cell_blk->buffer  != nullptr && cell_blk->data  != nullptr;
-    const bool have_blk_cells = blk_cells->buffer != nullptr && blk_cells->data != nullptr;
+    const bool have_cell_blk  = cell_blk  != nullptr && cell_blk->buffer  != nullptr && cell_blk->data  != nullptr;
+    const bool have_blk_cells = blk_cells != nullptr && blk_cells->buffer != nullptr && blk_cells->data != nullptr;
     if (have_cell_blk) {
         GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
     }
@@ -695,16 +694,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     }
     GGML_ASSERT(ggml_backend_buffer_is_host(blk_pos->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(bias->buffer));
-=======
-    if (direct_tail == nullptr) {
-        // Generic QSA path: retain upstream's sequence-set grouping and 2D/mRoPE ranking fixes.
-        GGML_ASSERT(cell_blk != nullptr);
-        mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
-        return;
-    }
->>>>>>> 640ff7c81a74381b4a23b92b57c1b3d3e88e61bf
-
-    const bool block_topk = true;
+    const bool block_topk = direct_tail != nullptr;
 
     // Direct block-top-k never consumes the context-sized cell -> block map. The graph
     // therefore prunes that input entirely; derive the cache shape from the memory and
@@ -713,7 +703,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     const int64_t n_ns     = blk_cells->ne[1];        // streams in this ubatch
     const int64_t n_blocks = blk_pos->ne[0]/(4*n_ns);
 
-    GGML_ASSERT(block_topk || cell_blk != nullptr);
+    // GGML_ASSERT(block_topk || cell_blk != nullptr);
     if (cell_blk != nullptr) {
         GGML_ASSERT(cell_blk->ne[0] == n_kv && cell_blk->ne[1] == n_ns);
     }
@@ -725,13 +715,8 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     const bool direct = block_topk && n_tps == 1 && direct_mask != nullptr;
     const bool compact_mask = block_topk && direct_mask != nullptr;
 
-<<<<<<< HEAD
     int32_t * dst_cell_blk  = have_cell_blk ? (int32_t *) cell_blk->data : nullptr;
     int32_t * dst_blk_cells = have_blk_cells ? (int32_t *) blk_cells->data : nullptr;
-=======
-    int32_t * dst_cell_blk  = cell_blk != nullptr ? (int32_t *) cell_blk->data : nullptr;
-    int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
->>>>>>> 640ff7c81a74381b4a23b92b57c1b3d3e88e61bf
     int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
     float   * dst_bias      = (float   *) bias->data;
 
@@ -754,13 +739,8 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
         const auto & cells = mem->get_mem_idx()->get_cells(seq_of_stream);
 
-<<<<<<< HEAD
         int32_t * cur_cell_blk  = dst_cell_blk ? dst_cell_blk + s*n_kv : nullptr;
         int32_t * cur_blk_cells = dst_blk_cells ? dst_blk_cells + s*(r*n_blocks) : nullptr;
-=======
-        int32_t * cur_cell_blk  = dst_cell_blk != nullptr ? dst_cell_blk + s*n_kv : nullptr;
-        int32_t * cur_blk_cells = dst_blk_cells + s*(r*n_blocks);
->>>>>>> 640ff7c81a74381b4a23b92b57c1b3d3e88e61bf
 
         // an incomplete block cannot be pooled; the bias below forces those tail cells in
         // -1 means no usable block, and block 0 only keeps the gather in range
@@ -805,12 +785,6 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
                 }
                 cur_cell_blk[j] = blk_of[j] < 0 ? 0 : blk_of[j];
             }
-<<<<<<< HEAD
-            if (cur_cell_blk) {
-                cur_cell_blk[j] = blk_of[j] < 0 ? 0 : blk_of[j];
-            }
-=======
->>>>>>> 640ff7c81a74381b4a23b92b57c1b3d3e88e61bf
         }
 
         for (int64_t ii = 0; ii < n_tps; ++ii) {
@@ -832,7 +806,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
                         : (b*r >= tail_start ? 1e9f : (filled[b] < r ? -INFINITY : 0.0f));
                 }
 
-                if (block_topk) {
+                if (block_topk && direct_tail != nullptr) {
                     GGML_ASSERT(n_ns == 1 && ubatch->n_seqs_unq == 1);
                     const int64_t extra = direct_tail->ne[0];
 
