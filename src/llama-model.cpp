@@ -29,6 +29,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -1436,6 +1437,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
     const auto & tensor_split = params.tensor_split;
 
+    const char * mlock_ple_env = getenv("LLAMA_MLOCK_PLE");
+    const bool mlock_ple = mlock_ple_env && mlock_ple_env[0] != '\0' && mlock_ple_env[0] != '0';
+    if (mlock_ple && use_mlock) {
+        LLAMA_LOG_WARN("%s: LLAMA_MLOCK_PLE=1 ignored when load_mode already mlocks (use --load-mode mmap)\n", __func__);
+    }
+    if (mlock_ple && !use_mlock) {
+        LLAMA_LOG_INFO("%s: LLAMA_MLOCK_PLE=1 — will VirtualLock TENSOR_READ_LAZY tables only (PLE)\n", __func__);
+        if (ml.lazy.mode != LLAMA_LAZY_MODE_OFF) {
+            LLAMA_LOG_WARN("%s: LLAMA_MLOCK_PLE needs --lazy-mode off so the PLE table is mapped for pinning\n", __func__);
+        }
+    }
+
     const int n_layer_all = hparams.n_layer_all;
     const int n_gpu_layers = this->n_gpu_layers();
 
@@ -1850,8 +1863,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     // load tensor data
+    // LLAMA_MLOCK_PLE: pass mlock_mmaps (empty) so PLE ranges can be VirtualLocked without
+    // seeding per-file locks via init_mappings (that path mlocks every shard).
+    llama_mlocks * data_mlocks = nullptr;
+    if (use_mlock) {
+        data_mlocks = &pimpl->mlock_mmaps;
+    } else if (mlock_ple) {
+        data_mlocks = &pimpl->mlock_mmaps;
+    }
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
-        if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+        if (!ml.load_all_data(ctx, buf_map, data_mlocks, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
     }

@@ -1,5 +1,12 @@
 # llama.cpp optimized for V100 & RTX 2080 Ti
 
+> **Additional local layer (this working tree):** a second optimization pass for
+> **Qwen3.8-Flash-Next on 2x V100 (NVLink)** — QSA block-sparse indexer (slim),
+> sparse-FA all-`-inf` tile skip, PLE pinning (`LLAMA_MLOCK_PLE`), 54 GiB n-gram host
+> offload, `--moe-cache` hot-expert VRAM cache, and the full Volta + Qwen feature and
+> benchmark breakdown: see **[README-FORK.md](README-FORK.md)** and
+> [docs/fork-benchmarks.md](docs/fork-benchmarks.md).
+
 [![GitHub stars](https://img.shields.io/github/stars/mistrjirka/llama.cpp?style=flat-square&logo=github)](https://github.com/mistrjirka/llama.cpp/stargazers)
 
 A CUDA performance fork of [`llama.cpp`](https://github.com/ggml-org/llama.cpp) for NVIDIA Volta (SM70) and Turing (SM75), tested on a Tesla V100-SXM2 32 GB and an RTX 2080 Ti 22 GB. The main target is long-context Qwen3.8-27B serving; Ornith-1.5-35B-A3B has additional routed-MoE tuning.

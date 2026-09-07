@@ -12,6 +12,25 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
+#include "ggml-backend-moe-cache.h"
+
+struct ggml_moe_cache_api ggml_moe_cache = {};
+
+void ggml_moe_cache_unregister(const void * owner) {
+    if (ggml_moe_cache.owner == owner) {
+        ggml_moe_cache = {};
+    }
+}
+
+static void ggml_backend_moe_cache_invalidate_buffer(
+        ggml_backend_buffer_t buffer, const void * address, size_t size) {
+    if (!ggml_moe_cache.invalidate || !buffer || !address || size == 0 ||
+        buffer->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+        !ggml_backend_buffer_is_host(buffer)) {
+        return;
+    }
+    ggml_moe_cache.invalidate(address, size);
+}
 
 #include <assert.h>
 #include <limits.h>
@@ -118,6 +137,14 @@ void ggml_backend_buffer_free(ggml_backend_buffer_t buffer) {
         return;
     }
 
+    if (buffer->iface.get_base) {
+        void * base = ggml_backend_buffer_get_base(buffer);
+        if (base) {
+            ggml_backend_moe_cache_invalidate_buffer(
+                    buffer, base, ggml_backend_buffer_get_size(buffer));
+        }
+    }
+
     if (buffer->iface.free_buffer != NULL) {
         buffer->iface.free_buffer(buffer);
     }
@@ -165,6 +192,10 @@ void ggml_backend_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
         return;
     }
 
+    if (buffer->iface.get_base) {
+        ggml_backend_moe_cache_invalidate_buffer(
+                buffer, ggml_backend_buffer_get_base(buffer), buffer->size);
+    }
     buffer->iface.clear(buffer, value);
 }
 
@@ -181,6 +212,9 @@ size_t ggml_backend_buffer_get_alloc_size(ggml_backend_buffer_t buffer, const st
 }
 
 bool ggml_backend_buffer_is_host(ggml_backend_buffer_t buffer) {
+    if (buffer == NULL) {
+        return false;
+    }
     return ggml_backend_buft_is_host(ggml_backend_buffer_get_type(buffer));
 }
 
@@ -344,6 +378,8 @@ void ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, siz
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
 
+    ggml_backend_moe_cache_invalidate_buffer(
+            buf, (const char *) tensor->data + offset, size);
     buf->iface.set_tensor(buf, tensor, data, offset, size);
 }
 
@@ -381,6 +417,9 @@ void ggml_backend_tensor_set_2d(struct ggml_tensor * tensor, const void * data, 
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + (n_copies-1)*stride_tensor + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
 
+    ggml_backend_moe_cache_invalidate_buffer(
+            buf, (const char *) tensor->data + offset,
+            (n_copies - 1)*stride_tensor + size);
     buf->iface.set_tensor_2d(buf, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
 }
 
@@ -490,6 +529,23 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
 
     if (src == dst) {
         return;
+    }
+
+    if (src->buffer == NULL) {
+        GGML_ABORT("%s: src %s op=%s type=%s view_src=%s vsrc_op=%s vsrc_buf=%p dst=%s dst_buf=%p",
+                __func__,
+                src->name, ggml_op_name(src->op), ggml_type_name(src->type),
+                src->view_src ? src->view_src->name : "(none)",
+                src->view_src ? ggml_op_name(src->view_src->op) : "-",
+                src->view_src ? (void *) src->view_src->buffer : NULL,
+                dst->name, (void *) dst->buffer);
+    }
+    if (dst->buffer == NULL) {
+        GGML_ABORT("%s: dst %s op=%s type=%s view_src=%s src=%s src_buf=%p",
+                __func__,
+                dst->name, ggml_op_name(dst->op), ggml_type_name(dst->type),
+                dst->view_src ? dst->view_src->name : "(none)",
+                src->name, (void *) src->buffer);
     }
 
     if (ggml_backend_buffer_is_host(src->buffer)) {
@@ -822,6 +878,7 @@ struct ggml_backend_sched {
     int graph_inputs_capacity;
 
     struct ggml_context * ctx;
+    void * moe_cache_session;
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
@@ -1655,6 +1712,27 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    struct moe_cache_scope {
+        void * session;
+        void (*leave)(void *);
+
+        explicit moe_cache_scope(void * session)
+            : session(session), leave(ggml_moe_cache.session_leave) {
+            auto enter = ggml_moe_cache.session_enter;
+            if (enter && leave) {
+                enter(session);
+            } else {
+                leave = nullptr;
+            }
+        }
+
+        ~moe_cache_scope() {
+            if (leave) {
+                leave(session);
+            }
+        }
+    } cache_scope(sched->moe_cache_session);
+
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
@@ -1936,6 +2014,36 @@ ggml_backend_sched_t ggml_backend_sched_new_ex(
     return sched;
 }
 
+void ggml_backend_sched_set_moe_cache(
+        ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode, size_t budget_mib) {
+    GGML_ASSERT(sched);
+    if (mode == GGML_MOE_CACHE_MODE_UNSPECIFIED) {
+        return;
+    }
+
+    if (sched->moe_cache_session && ggml_moe_cache.session_destroy) {
+        ggml_moe_cache.session_destroy(sched->moe_cache_session);
+    }
+    sched->moe_cache_session = nullptr;
+    if (mode == GGML_MOE_CACHE_MODE_OFF ||
+        !ggml_moe_cache.query_config || !ggml_moe_cache.session_create) {
+        return;
+    }
+
+    ggml_moe_cache_config config = {};
+    const int automatic = mode == GGML_MOE_CACHE_MODE_AUTO ? 1 : 0;
+    if (!ggml_moe_cache.query_config(automatic, budget_mib, &config)) {
+        return;
+    }
+
+    void * cache_backends[GGML_SCHED_MAX_BACKENDS];
+    for (int index = 0; index < sched->n_backends; index++) {
+        cache_backends[index] = sched->backends[index];
+    }
+    sched->moe_cache_session = ggml_moe_cache.session_create(
+            cache_backends, sched->n_backends, &config);
+}
+
 ggml_backend_sched_t ggml_backend_sched_new(
         ggml_backend_t * backends,
         ggml_backend_buffer_type_t * bufts,
@@ -1949,6 +2057,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
+    }
+    if (sched->moe_cache_session && ggml_moe_cache.session_destroy) {
+        ggml_moe_cache.session_destroy(sched->moe_cache_session);
+        sched->moe_cache_session = NULL;
     }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {

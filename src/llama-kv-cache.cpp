@@ -5,15 +5,20 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#include "ggml-backend.h"
+
 #include <algorithm>
 #include <array>
 #include <cassert>
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
 #include <stdexcept>
 #include <unordered_map>
+#include <vector>
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
@@ -446,7 +451,81 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         }
     }
 
+    if (v_cells[0].get_used() == 0) {
+        // full erase: next alloc packs from 0 so QSA n_kv is not a leftover high-water
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            if (v_cells[s].get_used() == 0) {
+                v_heads[s] = 0;
+            }
+        }
+    }
+
+    compact_used();
+
     return true;
+}
+
+void llama_kv_cache::compact_used() {
+    const char * e = std::getenv("QWEN4EXP_KV_COMPACT");
+    if (e == nullptr || e[0] == '\0' || (e[0] == '0' && e[1] == '\0')) {
+        return;
+    }
+    if (other) {
+        return;
+    }
+    if (v_trans) {
+        // transposed V is not cell-major along ne[1]; packing rows would scramble it
+        return;
+    }
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        auto & cells = v_cells[s];
+        const uint32_t n_used = cells.get_used();
+        const uint32_t umax   = cells.used_max_p1();
+        if (n_used == 0) {
+            v_heads[s] = 0;
+            continue;
+        }
+        if (umax == n_used) {
+            continue;
+        }
+
+        std::vector<uint32_t> srcs = cells.used_idxs();
+        size_t max_row = 0;
+        for (const auto & layer : layers) {
+            if (layer.k_stream[s]) {
+                max_row = std::max(max_row, (size_t) layer.k_stream[s]->nb[1]);
+            }
+            if (layer.v_stream[s]) {
+                max_row = std::max(max_row, (size_t) layer.v_stream[s]->nb[1]);
+            }
+        }
+        std::vector<uint8_t> tmp(max_row);
+
+        auto copy_row = [&](ggml_tensor * t, uint32_t src, uint32_t dst) {
+            if (!t || src == dst) {
+                return;
+            }
+            const size_t row = t->nb[1];
+            ggml_backend_tensor_get(t, tmp.data(), (size_t) src * row, row);
+            ggml_backend_tensor_set(t, tmp.data(), (size_t) dst * row, row);
+        };
+
+        uint32_t dst = 0;
+        for (uint32_t src : srcs) {
+            if (src != dst) {
+                for (const auto & layer : layers) {
+                    copy_row(layer.k_stream[s], src, dst);
+                    copy_row(layer.v_stream[s], src, dst);
+                }
+                cells.mv(src, dst);
+            }
+            dst++;
+        }
+        v_heads[s] = n_used;
+        LLAMA_LOG_INFO("%s: compacted stream %u used=%u used_max_p1 %u -> %u\n",
+                __func__, s, n_used, umax, cells.used_max_p1());
+    }
 }
 
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {

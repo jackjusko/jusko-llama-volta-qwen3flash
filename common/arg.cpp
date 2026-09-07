@@ -23,6 +23,7 @@
 #endif
 
 #include <algorithm>
+#include <cerrno>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
@@ -887,6 +888,12 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     // parse all CLI args now, so that -hf is available below for remote preset resolution
     parse_cli_args();
+
+    if ((params.moe_cache.mode == COMMON_MOE_CACHE_MODE_ON ||
+         params.moe_cache.mode == COMMON_MOE_CACHE_MODE_AUTO) && !params.no_extra_bufts) {
+        LOG_INF("MoE cache placement disables weight repacking\n");
+        params.no_extra_bufts = true;
+    }
 
     postprocess_cpu_params(params.cpuparams,       nullptr);
     postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
@@ -2820,6 +2827,38 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"--moe-cache"}, "MODE",
+        "adaptively cache the hottest CPU-resident MoE experts in spare VRAM "
+        "(default: off; on/auto = park routed experts on CPU and fill leftover VRAM "
+        "on Pascal/Volta, including the P40 as a cache device; "
+        "off/0 = disabled; N = VRAM budget in MiB per device)",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache.mode_explicit = true;
+            params.moe_cache.fit_selected = false;
+
+            if (value == "off" || value == "0") {
+                params.moe_cache.mode       = COMMON_MOE_CACHE_MODE_OFF;
+                params.moe_cache.budget_mib = 0;
+            } else if (value == "auto") {
+                params.moe_cache.mode       = COMMON_MOE_CACHE_MODE_AUTO;
+                params.moe_cache.budget_mib = 0;
+            } else if (value == "on") {
+                params.moe_cache.mode       = COMMON_MOE_CACHE_MODE_ON;
+                params.moe_cache.budget_mib = 0;
+            } else {
+                char * end = nullptr;
+                errno = 0;
+                const long long budget_mb = strtoll(value.c_str(), &end, 10);
+                if (errno != 0 || end == value.c_str() || *end != '\0' ||
+                    budget_mb <= 0 || budget_mb > 1024 * 1024) {
+                    throw std::invalid_argument("expected auto, on, off, 0, or a positive MiB budget");
+                }
+                params.moe_cache.mode       = COMMON_MOE_CACHE_MODE_ON;
+                params.moe_cache.budget_mib = (size_t)budget_mb;
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"

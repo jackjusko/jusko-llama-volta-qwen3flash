@@ -255,6 +255,40 @@ static __global__ void flash_attn_ext_vec(
              // Increment pointers after each loop:
              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
 
+        if (mask) {
+            int all_inf = 1;
+            const int tid_m = threadIdx.y * WARP_SIZE + threadIdx.x;
+            if (k_VKQ_0 + tid_m < k_VKQ_max) {
+#pragma unroll
+                for (int j = 0; j < ncols; ++j) {
+                    if (ncols == 1 || ic0 + j < int(ne01.z)) {
+                        const float m = __half2float(maskh[j*ne11 + tid_m]);
+                        all_inf = all_inf && int(isinf(m) && m < 0.0f);
+                    }
+                }
+            }
+            all_inf = warp_reduce_all(all_inf);
+            if constexpr (nwarps > 1) {
+                __shared__ int wbuf[32];
+                if (threadIdx.x == 0) {
+                    wbuf[threadIdx.y] = all_inf;
+                }
+                __syncthreads();
+                if (threadIdx.y == 0) {
+                    all_inf = (threadIdx.x < nwarps) ? wbuf[threadIdx.x] : 1;
+                    all_inf = warp_reduce_all(all_inf);
+                    if (threadIdx.x == 0) {
+                        wbuf[0] = all_inf;
+                    }
+                }
+                __syncthreads();
+                all_inf = wbuf[0];
+            }
+            if (all_inf) {
+                continue;
+            }
+        }
+
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]; // KQ in registers.
 

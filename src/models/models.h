@@ -2324,6 +2324,9 @@ struct llama_model_qwen4exp : public llama_model_base {
         // so the layers sharing a ratio share one input set
         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
 
+        // slim top-k block ids for the layer currently being built (gather of r-row chunks)
+        ggml_tensor * last_qsa_block_ids = nullptr;
+
         // QSA: token indices this layer's queries may attend to, or nullptr for dense
         ggml_tensor * build_qsa_top_k(
   const llama_memory_hybrid_idx_context * mctx_hyb,

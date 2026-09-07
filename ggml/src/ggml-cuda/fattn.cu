@@ -555,6 +555,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+        // Opt-in A/B for Qwen3.8-Flash-Next QSA decode (Q tokens = 1, GQA_eff ~ 4 → TILE).
+        // DECODE_MMA: force WMMA even when the tile is "too small" for Volta TC.
+        // DECODE_VEC: force fattn-vec (better HBM for long n_kv / q8_0 KV).
+        if (Q->ne[1] <= 16 && std::getenv("GGML_CUDA_VOLTA_DECODE_MMA") != nullptr) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
+        if (can_use_vector_kernel && Q->ne[1] <= 8 && std::getenv("GGML_CUDA_VOLTA_DECODE_VEC") != nullptr) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }

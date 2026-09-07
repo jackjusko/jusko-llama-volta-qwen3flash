@@ -102,6 +102,11 @@ struct llama_model_loader {
             return tensors.count(ggml_get_name(t)) > 0;
         }
 
+        // TENSOR_READ_LAZY names, even when lazy_mode is off (for LLAMA_MLOCK_PLE)
+        bool marked(const ggml_tensor * t) const {
+            return marked_names.count(ggml_get_name(t)) > 0;
+        }
+
         const llama_mmap::ranges & for_file(uint32_t idx) const {
             static const llama_mmap::ranges none;
 
@@ -115,6 +120,7 @@ struct llama_model_loader {
     private:
         std::map<uint32_t, llama_mmap::ranges> ranges;
         std::set<std::string>                  tensors;
+        std::set<std::string>                  marked_names;
     } lazy;
 
     llama_files files;

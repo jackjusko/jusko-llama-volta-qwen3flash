@@ -225,6 +225,13 @@ extern "C" {
         LLAMA_CONTEXT_TYPE_MTP     = 1,
     };
 
+    enum llama_moe_cache_mode {
+        LLAMA_MOE_CACHE_MODE_UNSPECIFIED = -1,
+        LLAMA_MOE_CACHE_MODE_OFF = 0,
+        LLAMA_MOE_CACHE_MODE_AUTO = 1,
+        LLAMA_MOE_CACHE_MODE_ON = 2,
+    };
+
     // TODO: simplify (https://github.com/ggml-org/llama.cpp/pull/9294#pullrequestreview-2286561979)
     typedef struct llama_token_data {
         llama_token id; // token id
@@ -421,6 +428,8 @@ extern "C" {
         uint32_t n_pipeline_copies; // pipeline scheduler copies, 0 = backend default [EXPERIMENTAL]
         uint32_t prefill_reuse;     // CUDA prefill GEMM tile for lossless weight reuse, 0 = disabled [EXPERIMENTAL]
         bool rs_rollback_prompt_only; // keep recurrent rollback snapshots for PP but not TG [EXPERIMENTAL]
+        enum llama_moe_cache_mode moe_cache_mode; // runtime MoE expert cache mode
+        size_t moe_cache_budget_mib;               // 0 uses the provider's available-memory budget
     };
 
     struct llama_model_tensor_override {

@@ -24,6 +24,9 @@ struct llama_cparams {
 
     int32_t  nextn_layer_offset = 0;
 
+    enum llama_moe_cache_mode moe_cache_mode = LLAMA_MOE_CACHE_MODE_UNSPECIFIED;
+    size_t moe_cache_budget_mib = 0;
+
     float rope_freq_base;
     float rope_freq_scale;
 

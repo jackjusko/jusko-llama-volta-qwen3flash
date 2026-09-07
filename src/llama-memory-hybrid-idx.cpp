@@ -49,6 +49,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
         std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
         hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size;
+        hparams_idx.n_embd_head_v_full = model.hparams.indexer_head_size;
 
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
@@ -349,8 +350,19 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         bool blk_bias) const {
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
+    GGML_ASSERT(cell_blk && blk_cells && blk_pos && bias);
 
-    GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
+    // Slim decode does not reference cell_blk. Pooled-K decode does not reference blk_cells.
+    const bool have_cell_blk  = cell_blk->buffer  != nullptr && cell_blk->data  != nullptr;
+    const bool have_blk_cells = blk_cells->buffer != nullptr && blk_cells->data != nullptr;
+    if (have_cell_blk) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
+    }
+    if (have_blk_cells) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(blk_cells->buffer));
+    }
+    GGML_ASSERT(ggml_backend_buffer_is_host(blk_pos->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(bias->buffer));
 
     const int64_t n_kv     = cell_blk->ne[0];
     const int64_t n_ns     = cell_blk->ne[1];        // streams in this ubatch
@@ -361,8 +373,8 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     GGML_ASSERT(n_tokens % n_ns == 0);
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
 
-    int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
-    int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
+    int32_t * dst_cell_blk  = have_cell_blk ? (int32_t *) cell_blk->data : nullptr;
+    int32_t * dst_blk_cells = have_blk_cells ? (int32_t *) blk_cells->data : nullptr;
     int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
     float   * dst_bias      = (float   *) bias->data;
 
@@ -385,14 +397,16 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
         const auto & cells = mem->get_mem_idx()->get_cells(seq_of_stream);
 
-        int32_t * cur_cell_blk  = dst_cell_blk  + s*n_kv;
-        int32_t * cur_blk_cells = dst_blk_cells + s*(r*n_blocks);
+        int32_t * cur_cell_blk  = dst_cell_blk ? dst_cell_blk + s*n_kv : nullptr;
+        int32_t * cur_blk_cells = dst_blk_cells ? dst_blk_cells + s*(r*n_blocks) : nullptr;
 
         // an incomplete block cannot be pooled; the bias below forces those tail cells in
         // -1 means no usable block, and block 0 only keeps the gather in range
         std::fill(blk_of.begin(),  blk_of.end(),  -1);
         std::fill(filled.begin(),  filled.end(),   0);
-        std::fill(cur_blk_cells, cur_blk_cells + r*n_blocks, 0);
+        if (cur_blk_cells) {
+            std::fill(cur_blk_cells, cur_blk_cells + r*n_blocks, 0);
+        }
 
         // a cell no block covers needs its own -inf, which a per-block bias cannot carry
         // every cache path keeps the position below the cell window, so this stays false
@@ -412,7 +426,9 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
             }
 
             blk_of[j] = (int32_t) b;
-            cur_blk_cells[b*r + (p%r)] = (int32_t) j;
+            if (cur_blk_cells) {
+                cur_blk_cells[b*r + (p%r)] = (int32_t) j;
+            }
             filled[b]++;
         }
 
@@ -424,7 +440,9 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
             if (blk_of[j] >= 0 && filled[blk_of[j]] < r && !blk_bias) {
                 blk_of[j] = -1;
             }
-            cur_cell_blk[j] = blk_of[j] < 0 ? 0 : blk_of[j];
+            if (cur_cell_blk) {
+                cur_cell_blk[j] = blk_of[j] < 0 ? 0 : blk_of[j];
+            }
         }
 
         for (int64_t ii = 0; ii < n_tps; ++ii) {

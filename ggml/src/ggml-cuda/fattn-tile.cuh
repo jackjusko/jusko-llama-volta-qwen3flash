@@ -788,6 +788,50 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
     }
 }
 
+// QSA sparse FA: top-k unmask leaves most KV tiles all -inf. KV_max only trims a
+// trailing causal tail, so decode still walked full n_kv. Skipping a tile before
+// K/V HBM load is a no-op on softmax (weights are 0) and is O(width) for QSA.
+template <int warp_size, int nwarps, int ncols1, int nbatch_fa>
+static __device__ __forceinline__ bool fattn_tile_kv_tile_all_inf(
+        const half * maskh, const int stride_mask, const int k0, const int kmax,
+        const int col_Q_0, const uint3 ne01) {
+    if (!maskh) {
+        return false;
+    }
+
+    int all_inf = 1;
+    const int tid = threadIdx.y * warp_size + threadIdx.x;
+    const int nt  = nwarps * warp_size;
+#pragma unroll
+    for (int j = 0; j < ncols1; ++j) {
+        const int jq = fastmodulo((uint32_t) (col_Q_0 + j), ne01);
+        for (int i = tid; i < nbatch_fa; i += nt) {
+            if (k0 + i < kmax) {
+                const float m = __half2float(maskh[jq * stride_mask + k0 + i]);
+                all_inf = all_inf && int(isinf(m) && m < 0.0f);
+            }
+        }
+    }
+    all_inf = warp_reduce_all(all_inf);
+    if constexpr (nwarps > 1) {
+        __shared__ int wbuf[32];
+        if (threadIdx.x == 0) {
+            wbuf[threadIdx.y] = all_inf;
+        }
+        __syncthreads();
+        if (threadIdx.y == 0) {
+            all_inf = (threadIdx.x < nwarps) ? wbuf[threadIdx.x] : 1;
+            all_inf = warp_reduce_all(all_inf);
+            if (threadIdx.x == 0) {
+                wbuf[0] = all_inf;
+            }
+        }
+        __syncthreads();
+        all_inf = wbuf[0];
+    }
+    return all_inf != 0;
+}
+
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap> // D == head size
 __launch_bounds__(ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_tile_get_occupancy(DKQ, DV, ncols1*ncols2))
 static __global__ void flash_attn_tile(
@@ -956,25 +1000,34 @@ static __global__ void flash_attn_tile(
         // Branch with out-of-bounds checks.
         int k_VKQ_0 = blockIdx.y*nbatch_fa;
         while (k_VKQ_0 < k_VKQ_max - nbatch_fa) {
-            constexpr bool oob_check = false;
-            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
-                (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+            if (!fattn_tile_kv_tile_all_inf<warp_size, nwarps, ncols1, nbatch_fa>(
+                    maskh, stride_mask, k_VKQ_0, k_VKQ_max, col_Q_0, ne01)) {
+                constexpr bool oob_check = false;
+                flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
+                    (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+                    stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+            }
             k_VKQ_0 += gridDim.y*nbatch_fa;
         }
         if (k_VKQ_0 < k_VKQ_max) {
-            constexpr bool oob_check = true;
-            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
-                (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+            if (!fattn_tile_kv_tile_all_inf<warp_size, nwarps, ncols1, nbatch_fa>(
+                    maskh, stride_mask, k_VKQ_0, k_VKQ_max, col_Q_0, ne01)) {
+                constexpr bool oob_check = true;
+                flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
+                    (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+                    stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+            }
         }
     } else {
         // Branch without out-of-bounds checks.
         for (int k_VKQ_0 = blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
-            constexpr bool oob_check = false;
-            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
-                (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+            if (!fattn_tile_kv_tile_all_inf<warp_size, nwarps, ncols1, nbatch_fa>(
+                    maskh, stride_mask, k_VKQ_0, k_VKQ_max, col_Q_0, ne01)) {
+                constexpr bool oob_check = false;
+                flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
+                    (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+                    stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+            }
         }
     }
 

@@ -84,6 +84,10 @@ public:
         return used.size();
     }
 
+    std::vector<uint32_t> used_idxs() const {
+        return std::vector<uint32_t>(used.begin(), used.end());
+    }
+
     // the index of the first cell that is used
     // return 0 if no cells are used
     uint32_t used_min() const {
@@ -100,25 +104,29 @@ public:
         return has_shift;
     }
 
-    // move cell isrc to idst (used during defrag)
-    //void mv(uint32_t isrc, uint32_t idst) {
-    //    assert(isrc < pos.size());
-    //    assert(idst < pos.size());
+    // move cell isrc to idst (used during compact). seq_pos is keyed by
+    // (seq, token pos), not cell index, so it does not change.
+    void mv(uint32_t isrc, uint32_t idst) {
+        assert(isrc < pos.size());
+        assert(idst < pos.size());
+        assert(isrc != idst);
 
-    //    assert(pos[idst] == -1);
-    //    assert(pos[isrc] != -1);
+        assert(pos[idst] == -1);
+        assert(pos[isrc] != -1);
 
-    //    pos  [idst] = pos  [isrc];
-    //    shift[idst] = shift[isrc];
-    //    seq  [idst] = seq  [isrc];
+        pos  [idst] = pos  [isrc];
+        shift[idst] = shift[isrc];
+        seq  [idst] = seq  [isrc];
+        ext  [idst] = ext  [isrc];
 
-    //    pos  [isrc] = -1;
-    //    shift[isrc] =  0;
-    //    seq  [isrc].reset();
+        pos  [isrc] = -1;
+        shift[isrc] =  0;
+        seq  [isrc].reset();
+        ext  [isrc].reset();
 
-    //    used.erase (isrc);
-    //    used.insert(idst);
-    //}
+        used.erase (isrc);
+        used.insert(idst);
+    }
 
     // copy the state of cells [i, i + n) (used for save/restore the state of the cells)
     llama_kv_cells cp(uint32_t i, uint32_t n) const {

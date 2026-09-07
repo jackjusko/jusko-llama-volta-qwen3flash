@@ -4959,10 +4959,6 @@ void server_routes::init_routes() {
 
     this->post_slots = [this](const server_http_req & req) {
         auto res = create_response();
-        if (params.slot_save_path.empty()) {
-            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
-            return res;
-        }
 
         std::string id_slot_str = req.get_param("id_slot");
 
@@ -4975,6 +4971,12 @@ void server_routes::init_routes() {
         }
 
         std::string action = req.get_param("action");
+
+        // erase does not write files; save/restore still need --slot-save-path
+        if (params.slot_save_path.empty() && action != "erase") {
+            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
 
         if (action == "save") {
             return handle_slots_save(req, id_slot);

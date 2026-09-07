@@ -153,3 +153,30 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# --- Ling-3.0-flash local working-tree artifacts (never publish) ---
+# local model mirrors / HF caches / tool caches that may be dropped next to the build
+/models/
+/.hf/
+/.tmp/
+/.vs-host/
+*.safetensors
+# profiler / traces
+*.ncu-rep
+*.nsys-rep
+*.etl
+*.qdrep
+*.qdstrm
+*.sqlite
+*.sqlite3
+# root-level sweep/run leftovers (copies under docs/examples/ stay tracked)
+/run-*.ps1
+/run-*.cmd
+/bench-matrix.ps1
+/bench-results.jsonl
+/server-sweep*
+/wave-*.log
+/wave-*.txt
+/slim-debug.txt
+/_mk-ple-symlink.*
+/ple-move-to-y.log

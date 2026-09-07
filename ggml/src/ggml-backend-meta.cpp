@@ -19,6 +19,18 @@
 #include <utility>
 #include <vector>
 
+// Views of host graph inputs (op NONE) are no-ops for meta simple-tensor split.
+// A NONE view_src with buffer==nullptr is the same class: do not call is_host(NULL).
+static bool ggml_backend_meta_is_host_none_view(const ggml_tensor * node) {
+    if (node == nullptr || node->view_src == nullptr || node->view_src->op != GGML_OP_NONE) {
+        return false;
+    }
+    if (node->view_src->buffer == nullptr) {
+        return true;
+    }
+    return ggml_backend_buffer_is_host(node->view_src->buffer);
+}
+
 struct ggml_backend_meta_device;
 struct ggml_backend_meta_buffer_type;
 struct ggml_backend_meta_buffer;
@@ -2018,7 +2030,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
+                if (ggml_backend_meta_is_host_none_view(node)) {
                     // FIXME s_copy_main is on the CPU and its view seems to be incorrectly added to the graph nodes.
                     // For regular usage this doesn't matter since it's a noop but trying to call ggml_backend_meta_buffer_simple_tensor results in a crash.
                     bcj.nodes[i] = node;
@@ -2151,7 +2163,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         }
                     }
 
-                    if (next->view_src != nullptr && next->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(next->view_src->buffer)) {
+                    if (ggml_backend_meta_is_host_none_view(next)) {
                         continue;
                     }
                     if (ggml_backend_meta_get_split_state(next, false).axis != GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
@@ -2190,7 +2202,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             int i_start = 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
+                if (ggml_backend_meta_is_host_none_view(node)) {
                     continue;
                 }
                 const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);

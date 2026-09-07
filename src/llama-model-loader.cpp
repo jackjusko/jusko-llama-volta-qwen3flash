@@ -10,8 +10,10 @@
 #include <array>
 #include <cinttypes>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <future>
+#include <memory>
 #include <regex>
 
 static const size_t kiB = 1024;
@@ -1079,6 +1081,11 @@ ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() {
 }
 
 bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w) {
+    // Always record READ_LAZY candidates so LLAMA_MLOCK_PLE can pin them when lazy_mode is off.
+    if (w) {
+        marked_names.insert(name);
+    }
+
     if (mode == LLAMA_LAZY_MODE_OFF) {
         return false;
     }
@@ -1104,6 +1111,37 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
     }
 
     return true;
+}
+
+// Pin TENSOR_READ_LAZY tables (PLE) into the process working set without mlocking every GGUF shard.
+// Set LLAMA_MLOCK_PLE=1 with --lazy-mode off --load-mode mmap (not mmap+mlock).
+static bool llama_env_mlock_ple() {
+    const char * e = getenv("LLAMA_MLOCK_PLE");
+    return e && e[0] != '\0' && e[0] != '0';
+}
+
+static void llama_mlock_ple_range(llama_mlocks * lmlocks, void * ptr, size_t n_size, const char * name) {
+    if (!lmlocks || !ptr || n_size == 0) {
+        return;
+    }
+    if (!llama_mlock::SUPPORTED) {
+        LLAMA_LOG_WARN("%s: mlock not supported; cannot pin %s\n", __func__, name);
+        return;
+    }
+
+    auto lock = std::make_unique<llama_mlock>();
+    lock->init(ptr);
+
+    // Chunk VirtualLock: a single 50+ GiB call is fragile on Windows working-set limits.
+    constexpr size_t chunk = 256ull * 1024 * 1024;
+    for (size_t done = chunk; done < n_size; done += chunk) {
+        lock->grow_to(done);
+    }
+    lock->grow_to(n_size);
+
+    LLAMA_LOG_INFO("%s: pinned %s (%.2f GiB) via VirtualLock/mlock\n",
+            __func__, name, n_size / (1024.0 * 1024.0 * 1024.0));
+    lmlocks->emplace_back(std::move(lock));
 }
 
 struct ggml_tensor * llama_model_loader::create_tensor(
@@ -1635,8 +1673,15 @@ bool llama_model_loader::load_all_data(
 
                 // locking a lazy tensor would fault all of it in, which is what lazy avoids
                 if (lmlocks && !lazy.has(cur)) {
-                    const auto & lmlock = lmlocks->at(weight->idx);
-                    lmlock->grow_to(weight->offs + n_size);
+                    // Full mmap+mlock: init_mappings pre-seeds one lock per file (size == n_files).
+                    // LLAMA_MLOCK_PLE: locks start empty; pin only TENSOR_READ_LAZY ranges.
+                    const bool full_mlock = weight->idx < lmlocks->size();
+                    if (!full_mlock && llama_env_mlock_ple() && lazy.marked(cur)) {
+                        llama_mlock_ple_range(lmlocks, data, n_size, ggml_get_name(cur));
+                    } else if (full_mlock) {
+                        const auto & lmlock = lmlocks->at(weight->idx);
+                        lmlock->grow_to(weight->offs + n_size);
+                    }
                 }
 
                 auto & mmap_used = mmaps_used[weight->idx];
@@ -1644,6 +1689,9 @@ bool llama_model_loader::load_all_data(
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
+                if (lmlocks && llama_env_mlock_ple() && lazy.marked(cur) && cur->data) {
+                    llama_mlock_ple_range(lmlocks, cur->data, n_size, ggml_get_name(cur));
+                }
             }
         } else {
             const auto & file = files.at(weight->idx);
@@ -1655,6 +1703,9 @@ bool llama_model_loader::load_all_data(
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
                     }));
+                }
+                if (lmlocks && llama_env_mlock_ple() && lazy.marked(cur) && cur->data) {
+                    llama_mlock_ple_range(lmlocks, cur->data, n_size, ggml_get_name(cur));
                 }
             } else {
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
