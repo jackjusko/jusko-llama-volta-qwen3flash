@@ -1,4 +1,5 @@
 #include "binbcast.cuh"
+#include "hc-sc-comb.cuh"
 #include <cstdint>
 #include <utility>
 
@@ -435,6 +436,9 @@ void ggml_cuda_op_repeat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 void ggml_cuda_op_add(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (ggml_cuda_hscb_try_dispatch(ctx, dst)) {
+        return;
+    }
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_add>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
 }
 

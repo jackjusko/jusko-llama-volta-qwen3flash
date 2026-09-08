@@ -2027,7 +2027,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (probs_in == nullptr) {
         logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
-        if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
+        if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS ||
+            ((arch == LLM_ARCH_DFLASH || arch == LLM_ARCH_QWEN4EXP) &&
+             gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX)) {
             ggml_mul_mat_set_prec(logits, GGML_PREC_F32);
         }
         cb(logits, "ffn_moe_logits", il);
@@ -2109,7 +2111,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // select experts
     ggml_tensor * selected_experts = selected_experts_in;
+    ggml_tensor * probs_reshaped = nullptr;
     if (selected_experts == nullptr) {
+        if (arch == LLM_ARCH_DFLASH || arch == LLM_ARCH_QWEN4EXP) {
+            probs_reshaped = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
+            cb(probs_reshaped, "ffn_moe_probs_3d", il);
+        }
         selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
         cb(selected_experts->src[0], "ffn_moe_argsort", il);
     }
@@ -2120,6 +2127,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * f_sel = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
         selected_experts = ggml_cast(ctx0, ggml_scale(ctx0, f_sel, 1.0f / float(hparams.n_group_experts)), GGML_TYPE_I32);
         probs = ggml_reshape_3d(ctx0, probs, 1, hparams.n_expert, n_tokens);
+    } else if ((arch == LLM_ARCH_DFLASH || arch == LLM_ARCH_QWEN4EXP) && probs_reshaped != nullptr) {
+        probs = probs_reshaped;
     } else {
         probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
     }

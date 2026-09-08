@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -2645,7 +2646,23 @@ ggml_status llama_context::graph_compute(
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
 
-    // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
+    if (getenv("QWEN4EXP_CENSUS")) {
+        static int census_budget = 400;
+        const int n_nodes = ggml_graph_n_nodes(gf);
+        if (census_budget > 0) {
+            fprintf(stderr, "census: batched=%d n_nodes=%d splits=%d budget=%d\n",
+                (int) batched, n_nodes, ggml_backend_sched_get_n_splits(sched.get()), census_budget);
+            const int nshow = n_nodes < 80 ? n_nodes : 80;
+            ggml_tensor ** nodes = ggml_graph_nodes(gf);
+            for (int k = n_nodes - nshow; k < n_nodes; ++k) {
+                ggml_tensor * nd = nodes[k];
+                fprintf(stderr, "  %4d op=%-18s type=%d ne=%ld n=%ld %s\n", k,
+                    ggml_op_name(nd->op), nd->type, (long) nd->ne[0], (long) ggml_nelements(nd),
+                    nd->name ? nd->name : "");
+            }
+            --census_budget;
+        }
+    }
 
     return status;
 }
