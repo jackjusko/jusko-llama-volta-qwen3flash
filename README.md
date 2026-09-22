@@ -1,4 +1,6 @@
-# llama.cpp optimized for V100 & RTX 2080 Ti
+# llama.cpp optimized for Qwen 3.8 Flash Next on the Volta / sm70 family
+\
+Todo: update the readme below, as this branch was originally forked from a different custom one. Everything relevant is in the forkbenchmarks.md - this fork has some remaining optimizations for turing for other different models, but the primary focus of this fork is specifically for qwen 3.8 flash next on volta.
 
 > **Additional local layer (this working tree):** a second optimization pass for
 > **Qwen3.8-Flash-Next on 2x V100 (NVLink)** — QSA block-sparse indexer (slim),
