@@ -2030,7 +2030,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS ||
             ((arch == LLM_ARCH_DFLASH || arch == LLM_ARCH_QWEN4EXP) &&
              gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX)) {
-            ggml_mul_mat_set_prec(logits, GGML_PREC_F32);
+            ggml_prec_set_acc(logits, GGML_PREC_F32);
         }
         cb(logits, "ffn_moe_logits", il);
     } else {
