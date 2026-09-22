@@ -1,4 +1,4 @@
-# llama.cpp optimized for V100 & RTX 2080 Ti
+# llama.cpp optimized for Qwen 3.8 Flash Next on the Volta / sm70 family
 
 > **Additional local layer (this working tree):** a second optimization pass for
 > **Qwen3.8-Flash-Next on 2x V100 (NVLink)** — QSA block-sparse indexer (slim),
