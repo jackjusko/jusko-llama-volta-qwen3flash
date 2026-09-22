@@ -366,6 +366,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     w = ggml_scale(ctx0, w, 2.0f);
 
     ggml_tensor * b = ggml_reshape_3d(ctx0, block_out, n_embd, 1, nt);
+    // The upstream hc-pre/hc-mix ops emit the per-stream weights stream-major
+    // (hc, nt); normalize to (1, hc, nt) so the weight broadcasts over the
+    // embedding dimension regardless of producer layout.
+    w = ggml_reshape_3d(ctx0, w, 1, hc, nt);
     ggml_tensor * cur = nullptr;
     const char * hc_bcast = getenv("QWEN4EXP_HC_COMB_BCAST");
     if (hc_bcast && atoi(hc_bcast) != 0) {
